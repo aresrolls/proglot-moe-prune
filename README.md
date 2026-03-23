@@ -1,5 +1,7 @@
 # **Proglot MAS LLM Optimization: MoE Expert Pruning**
 
+# NOTE: RESULTS TO BE ADDED BY 29.03.26
+
 ## **Overview**
 
 This repository contains the experimental codebase for optimizing the gpt-oss-20b Mixture-of-Experts (MoE) large language model. The project is developed as part of a Master's thesis in Data Science at MIPT for the "Proglot" electronic food diary multi-agent system (MAS).  
