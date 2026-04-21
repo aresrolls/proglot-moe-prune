@@ -1,64 +1,89 @@
-# **Proglot MAS LLM Optimization: MoE Expert Pruning**
-
-# NOTE: RESULTS TO BE ADDED BY 29.03.26
+# **Proglot MAS LLM Optimization: Gemma 4 MoE Expert Pruning**
 
 ## **Overview**
 
-This repository contains the experimental codebase for optimizing the gpt-oss-20b Mixture-of-Experts (MoE) large language model. The project is developed as part of a Master's thesis in Data Science at MIPT for the "Proglot" electronic food diary multi-agent system (MAS).  
-The primary objective is to reduce the inference latency (Time To First Token, TTFT) to under 500ms and limit VRAM consumption to under 10GB for consumer-grade GPU deployment, while maintaining \>95% clinical accuracy in generating dietary recommendations.
+This repository contains the experimental codebase for optimizing the `google/gemma-4-26b-a4b-it` Mixture-of-Experts (MoE) large language model. The project is developed as part of a Master's thesis in Data Science at MIPT for the "Proglot" electronic food diary multi-agent system (MAS).
+
+The primary objective is to dramatically reduce the VRAM footprint and inference latency for deployment on consumer-grade Apple Silicon and local GPUs. By applying a custom REAP-inspired methodology, we successfully compressed the model from ~40GB down to ~12.3GB, while maintaining clinical accuracy in JSON generation, structured data parsing, and dietary planning.
 
 ## **Project Status & Conclusion**
 
-Синтез структурного сжатия модели и алгоритмического ускорения устраняет проблему высоких задержек в MAS. Это делает технически и экономически целесообразным внедрение тяжелых LLM в real-time контур электронного дневника питания.  
-Целевые аппаратные метрики скорости (ускорение инференса в 4–5 раз) достигнуты. Влияние на удержание (retention) измеряется A/B тестированием в рамках текущего пилотного запуска.
+Синтез структурного сжатия модели (MoE Pruning) и алгоритмического квантования (GGUF 4-bit) устраняет проблему высоких аппаратных требований для тяжелых мультимодальных LLM. Это делает технически и экономически целесообразным внедрение 26B параметров в real-time контур электронного дневника питания.
+
+**Key Achievements:**
+* Successfully profiled a fine-grained MoE architecture (128 experts per layer).
+* Safely pruned 25% of the model's expert weights (dropping the bottom 32 experts per layer) with negligible loss to the target domain's active knowledge base.
+* Quantized the resulting FP16 model (38.9 GB) down to a highly efficient Q4_K_M GGUF format (12.3 GB, 5.32 BPW).
 
 ## **Methodology**
 
 The optimization pipeline consists of three core components:
 
-1. **Expert Pruning (REAP):** Routing-Guided Expert Activation Pruning. We profile the activation norms of the 32 experts per layer using a domain-specific dataset (FoodyLLM/TADA) and surgically remove the 4 least utilized experts (12.5% reduction) for nutritional reasoning tasks.  
-2. **Quantization:** Converting the pruned BF16 weights into 4-bit formats (MXFP4 / GGUF) for strict memory constraints.  
-3. **Speculative Decoding:** Integrating a distilled gpt-oss-Nano model as a draft agent within the MAS to accelerate token generation.
+1. **Activation Profiling (Forward Hooks):** We profiled the routing distributions across all layers using a custom multi-agent dataset (`waterfall_dataset_2.jsonl`). PyTorch `register_forward_hook` was attached to the Gemma 4 routers to capture top-2 expert selections.
+2. **Surgical Expert Pruning (REAP):** Based on the generated `expert_heatmap.json`, we identified a strict long-tail distribution. We sliced the fused expert tensors (`down_proj` and `gate_up_proj`), permanently removing the 32 least utilized experts per layer, retaining the top 96.
+3. **Quantization & Export:** The pruned FP16 weights were merged and quantized using `llama.cpp` into the `Q4_K_M` GGUF format for strict memory constraints.
 
 ## **Repository Structure**
 
-* `scripts/profile\_reap.py`: Attaches PyTorch forward hooks to MoeLayer blocks to calculate expert importance scores via router logits and activation norms. Includes memory-mapping and checkpointing for execution on 32GB VRAM workstations.  
-* `scripts/surgery.py`: Modifies the PyTorch nn.Module state dictionary, drops targeted expert tensors, and renormalizes the router weight matrices.  
-* `scripts/evaluate.py`: Benchmarking scripts for measuring TTFT, throughput (TPS), and evaluating domain accuracy against the FoodyLLM QA baseline.  
-* `notebooks/`: Jupyter notebooks containing exploratory data analysis of expert activation distributions and A/B test telemetry processing (retention/churn metrics).
+* `reap_profiler.py`: Attaches PyTorch forward hooks to the `language_model.layers` routers to calculate expert importance scores based on a custom JSON-parsing dataset. Runs in FP16 dynamically distributed across GPUs.
+* `reap_surgery.py`: Loads the unquantized weights into RAM, reads the heatmap distribution, modifies the PyTorch `nn.Parameter` tensors to drop targeted expert slices, and renormalizes the model configuration.
+* `waterfall_dataset_2.jsonl`: The multi-agent calibration dataset containing planner, critic, and parser prompts.
 
-## **Quick Start**
+## **Quick Start (Dockerized Cluster Execution)**
 
-### **1\. Environment Setup**
+Due to the size of the base model, this pipeline is designed to be executed via Docker on a remote GPU cluster.
 
-``` bash
-python3 \-m venv prune\_env  
-source prune\_env/bin/activate  
-pip install \-r requirements.txt
-```
+### **1. Model Acquisition**
 
-### **2\. Model Acquisition**
-
-Download the unquantized, abliterated BF16 base weights (approx. 41 GB):  
-
-``` bash
-huggingface-cli download huihui-ai/Huihui-gpt-oss-20b-BF16-abliterated \\  
-  \--local-dir ./models/gpt-oss-20b-hf \\  
-  \--resume-download
-```
-
-### **3\. Profiling Activations**
-
-Run the calibration script to compute REAP scores. This will generate `reap\_profiling\_checkpoint.pt`.
-
-``` bash
-python scripts/profile\_reap.py \--model ./models/gpt-oss-20b-hf \--dataset data/foody\_qa\_calibration.json
-```
-
-### **4\. Pruning and Export**
-
-Apply the structural modifications and save the new weights:  
+Download the unquantized Gemma 4 26B MoE FP16 base weights directly into your cluster's Docker storage volume:
 
 ```bash
-python scripts/surgery.py \--checkpoint reap\_profiling\_checkpoint.pt \--output ./models/gpt-oss-20b-pruned  
+docker run -d \
+  --name gemma-downloader \
+  -v /your/remote/volume/:/models \
+  -e HF_TOKEN="YOUR_HF_TOKEN" \
+  python:3.11-slim \
+  bash -c "pip install huggingface_hub && hf download google/gemma-4-26b-moe-it --local-dir /models/gemma-26b-weights"
 ```
+
+### **2. Profiling Activations**
+
+Build the PyTorch 2.4.0 container and run the calibration script to compute expert scores. Ensure you restrict `max_length` to prevent OOM on large context windows.
+
+```bash
+docker build -t gemma-profiler .
+docker run -d \
+  --name profiler-run \
+  --gpus '"device=0,3"' \
+  -v /your/remote/volume/:/models \
+  gemma-profiler
+```
+*Output: `/models/expert_heatmap.json`*
+
+### **3. Surgical Pruning**
+
+Apply the structural modifications to drop 25% of the experts. This runs on CPU/RAM.
+
+```bash
+docker run -d \
+  --name surgeon-run \
+  -v /your/remote/volume/:/models \
+  gemma-profiler python reap_surgery.py
+```
+*Output: `/models/gemma-26b-pruned-json/` (Pruned FP16 HuggingFace format)*
+
+### **4. GGUF Quantization**
+
+Use `llama.cpp` to convert and quantize the pruned model for local deployment:
+
+```bash
+# Convert to GGUF (FP16)
+docker run --rm -it -v /your/remote/volume/:/models --entrypoint python3 ghcr.io/ggml-org/llama.cpp:full /app/convert_hf_to_gguf.py /models/gemma-26b-pruned-json --outfile /models/gemma-pruned-f16.gguf
+
+# Quantize to 4-bit (Q4_K_M)
+docker run --rm -it -v /your/remote/volume/:/models --entrypoint /app/llama-quantize ghcr.io/ggml-org/llama.cpp:full /models/gemma-pruned-f16.gguf /models/gemma-pruned-q4_k_m.gguf Q4_K_M
+```
+
+***
+
+How does this new structure look to you—do you want to include the specific `llama.cpp` Docker commands in the Quick Start, or would you prefer to keep that section focused strictly on your custom Python scripts?
